@@ -24,7 +24,7 @@ A high-performance Rust implementation of the FalkorDB CSV loader, designed to l
 ### Build from source
 
 ```bash
-git clone <repository-url>
+git clone [<repository-url>](https://github.com/FalkorDB/FalkorDB-Loader-RS)
 cd FalkorDBLoader-RS
 cargo build --release
 ```
