@@ -99,6 +99,8 @@ pub struct FalkorDBCSVLoader {
     terminate_on_error: Arc<AtomicBool>,
     /// Maximum number of consecutive failures before terminating
     max_consecutive_failures: usize,
+    /// Label mapping from edge labels to actual node labels
+    label_mapping: HashMap<String, String>,
 }
 
 impl FalkorDBCSVLoader {
@@ -132,7 +134,7 @@ impl FalkorDBCSVLoader {
         
         info!("✅ Connected to FalkorDB graph '{}'", graph_name);
         
-        Ok(Self {
+        let loader = Self {
             client,
             graph_name,
             csv_dir: PathBuf::from(csv_dir),
@@ -140,7 +142,10 @@ impl FalkorDBCSVLoader {
             progress_interval,
             terminate_on_error: Arc::new(AtomicBool::new(false)),
             max_consecutive_failures: 3,
-        })
+            label_mapping: HashMap::new(),
+        };
+        
+        Ok(loader)
     }
     
     /// Execute a FalkorDB graph query with health checks
@@ -223,6 +228,101 @@ impl FalkorDBCSVLoader {
     /// Sanitize label by replacing invalid characters
     fn sanitize_label(label: &str) -> String {
         label.replace(':', "_")
+    }
+    
+    /// Validate and analyze label consistency between node and edge files
+    pub fn validate_label_consistency(&self) -> Result<HashMap<String, String>> {
+        info!("🔍 Validating label consistency between node and edge files...");
+        
+        // Get node labels from filenames
+        let mut node_labels = std::collections::HashSet::new();
+        let csv_files = std::fs::read_dir(&self.csv_dir)?;
+        
+        for entry in csv_files {
+            let entry = entry?;
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            
+            if file_name.starts_with("nodes_") && file_name.ends_with(".csv") {
+                let raw_label = file_name
+                    .strip_prefix("nodes_")
+                    .unwrap()
+                    .strip_suffix(".csv")
+                    .unwrap();
+                let label = Self::sanitize_label(raw_label);
+                node_labels.insert(label);
+            }
+        }
+        
+        info!("📋 Found node labels: {:?}", node_labels.iter().collect::<Vec<_>>());
+        
+        // Get edge labels from edge files
+        let mut edge_labels = std::collections::HashSet::new();
+        let csv_files = std::fs::read_dir(&self.csv_dir)?;
+        
+        for entry in csv_files {
+            let entry = entry?;
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            
+            if file_name.starts_with("edges_") && file_name.ends_with(".csv") {
+                let file_path = entry.path();
+                
+                // Read first data row to get labels
+                let file = File::open(&file_path)?;
+                let mut rdr = csv::Reader::from_reader(file);
+                
+                if let Some(result) = rdr.deserialize::<HashMap<String, String>>().next() {
+                    let record = result?;
+                    if let (Some(source_label), Some(target_label)) = 
+                        (record.get("source_label"), record.get("target_label")) {
+                        edge_labels.insert(source_label.clone());
+                        edge_labels.insert(target_label.clone());
+                    }
+                }
+            }
+        }
+        
+        info!("📋 Found edge labels: {:?}", edge_labels.iter().collect::<Vec<_>>());
+        
+        // Create label mapping (case-insensitive matching)
+        let mut label_mapping = HashMap::new();
+        let mut missing_labels = Vec::new();
+        
+        for edge_label in &edge_labels {
+            let mut found = false;
+            
+            // Try exact match first
+            if node_labels.contains(edge_label) {
+                label_mapping.insert(edge_label.clone(), edge_label.clone());
+                found = true;
+            } else {
+                // Try case-insensitive match
+                for node_label in &node_labels {
+                    if node_label.to_lowercase() == edge_label.to_lowercase() {
+                        label_mapping.insert(edge_label.clone(), node_label.clone());
+                        info!("🔗 Mapped edge label '{}' -> node label '{}'", edge_label, node_label);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            
+            if !found {
+                missing_labels.push(edge_label.clone());
+            }
+        }
+        
+        if !missing_labels.is_empty() {
+            error!("❌ Found edge labels without corresponding node files: {:?}", missing_labels);
+            return Err(anyhow!("Label validation failed: missing node files for labels: {:?}", missing_labels));
+        }
+        
+        if label_mapping.is_empty() {
+            info!("✅ All labels match exactly");
+        } else {
+            info!("✅ Label validation complete. Mappings: {:?}", label_mapping);
+        }
+        
+        Ok(label_mapping)
     }
     
     /// Create ID indexes for all node labels
@@ -502,38 +602,26 @@ impl FalkorDBCSVLoader {
         Ok(())
     }
     
-    /// Parse value to appropriate type (int, float, or string) - matches Python repr() behavior
+    /// Parse value to appropriate type (treating all values as strings to avoid overflow)
     fn parse_value_for_property(value: &str) -> String {
         if value.is_empty() {
             return "None".to_string(); // Python uses None, not null
         }
         
-        // Try to parse as integer (Python repr behavior)
-        if let Ok(int_val) = value.parse::<i64>() {
-            return int_val.to_string();
-        }
-        
-        // Try to parse as float (Python repr behavior) 
-        if let Ok(float_val) = value.parse::<f64>() {
-            return float_val.to_string();
-        }
-        
-        // Return as quoted string (Python repr behavior)
-        format!("'{}'", value.replace("'", "\\'"))
+        // Always treat values as quoted strings to avoid numeric overflow issues
+        // This prevents i64/f64 parsing errors for very large numbers
+        format!("'{}'", value.replace("'", "\\''"))
     }
     
-    /// Parse ID value (separate from properties) - for node/edge IDs
+    /// Parse ID value (separate from properties) - for node/edge IDs (always as strings to avoid overflow)
     fn parse_id_value(value: &str) -> String {
         if value.is_empty() {
             return "''".to_string();
         }
         
-        // ID handling: quote if not a pure number (matches Python behavior)
-        if value.chars().all(|c| c.is_ascii_digit()) {
-            value.to_string() // Numeric ID, no quotes needed
-        } else {
-            format!("'{}'", value.replace("'", "\\'")) // String ID, needs quotes
-        }
+        // Always treat IDs as quoted strings to avoid any potential overflow issues
+        // This ensures compatibility with very large numeric IDs that might overflow i64
+        format!("'{}'", value.replace("'", "\\'"))
     }
     
     /// Load nodes from CSV file in batches
@@ -744,8 +832,14 @@ impl FalkorDBCSVLoader {
                 let mut properties = Vec::new();
                 
                 // Get source and target labels if available
-                let source_label = row.get("source_label").unwrap_or(&empty_string).trim();
-                let target_label = row.get("target_label").unwrap_or(&empty_string).trim();
+                let raw_source_label = row.get("source_label").unwrap_or(&empty_string).trim();
+                let raw_target_label = row.get("target_label").unwrap_or(&empty_string).trim();
+                
+                // Apply label mapping to resolve case mismatches
+                let source_label = self.label_mapping.get(raw_source_label)
+                    .map_or(raw_source_label, |s| s.as_str());
+                let target_label = self.label_mapping.get(raw_target_label)
+                    .map_or(raw_target_label, |s| s.as_str());
                 
                 // Add all properties except source, target, type, source_label, target_label
                 for (key, value) in row {
@@ -822,8 +916,8 @@ impl FalkorDBCSVLoader {
                 
                 // Debug: show label usage for first few records
                 if batch_num == 0 && j < 3 {
-                    info!("    Record {}: source_label={}, target_label={}", 
-                          j + 1, source_label, target_label);
+                    info!("    Record {}: raw_source_label='{}' -> '{}', raw_target_label='{}' -> '{}'", 
+                          j + 1, raw_source_label, source_label, raw_target_label, target_label);
                     if self.merge_mode {
                         info!("    Using MERGE mode for relationships");
                     } else {
@@ -934,10 +1028,14 @@ impl FalkorDBCSVLoader {
     }
     
     /// Load all CSV files from the csv_output directory
-    pub async fn load_all_csvs(&self, batch_size: usize) -> Result<()> {
+    pub async fn load_all_csvs(&mut self, batch_size: usize) -> Result<()> {
         if !self.csv_dir.exists() {
             return Err(anyhow!("Directory {:?} does not exist", self.csv_dir));
         }
+        
+        // Validate label consistency first
+        let label_mapping = self.validate_label_consistency()?;
+        self.label_mapping = label_mapping;
         
         let csv_files = std::fs::read_dir(&self.csv_dir)?;
         let mut node_files = Vec::new();
@@ -1135,7 +1233,7 @@ async fn main() -> Result<()> {
     
     let args = Args::parse();
     
-    let loader = FalkorDBCSVLoader::new(
+    let mut loader = FalkorDBCSVLoader::new(
         &args.host,
         args.port,
         args.graph_name,
