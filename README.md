@@ -13,6 +13,7 @@ A high-performance Rust implementation of the FalkorDB CSV loader, designed to l
 - **Error Handling**: Comprehensive error handling with detailed logging
 - **Label Sanitization**: Automatic handling of invalid characters in labels
 - **Connection Management**: Robust Redis connection handling with authentication support
+- **Multi-Graph Loading**: Support for loading multiple tenant datasets into separate graphs
 
 ## Installation
 
@@ -51,7 +52,8 @@ The binary will be available at `target/release/falkordb-loader`.
   --batch-size 1000 \
   --merge-mode \
   --stats \
-  --progress-interval 500
+  --progress-interval 500 \
+  --multi-graph
 ```
 
 ### Command-line options
@@ -66,6 +68,8 @@ The binary will be available at `target/release/falkordb-loader`.
 - `--merge-mode`: Use MERGE instead of CREATE for upsert behavior
 - `--stats`: Show graph statistics after loading
 - `--progress-interval`: Report progress every N records (default: 1000, set to 0 to disable)
+- `--multi-graph`: Enable multi-graph mode for loading tenant subdirectories into separate graphs
+- `--fail-fast`: Terminate on first critical error (useful for CI/CD pipelines)
 
 ### Environment variables for logging
 
@@ -89,6 +93,68 @@ Control progress reporting frequency:
 
 # Disable progress reporting entirely
 ./target/release/falkordb-loader my_graph --progress-interval 0
+```
+
+### Multi-graph loading
+
+Load multiple tenant datasets into separate graphs using the `--multi-graph` flag:
+
+```bash
+./target/release/falkordb-loader my_graph --csv-dir ./tenants --multi-graph
+```
+
+#### Directory structure for multi-graph mode
+
+Organize your CSV files into tenant subdirectories with the `tenant_` prefix:
+
+```
+tenants/
+├── tenant_company_a/
+│   ├── nodes_Person.csv
+│   ├── nodes_Product.csv
+│   ├── edges_PURCHASED.csv
+│   └── indexes.csv
+├── tenant_company_b/
+│   ├── nodes_Person.csv
+│   ├── nodes_Product.csv
+│   └── edges_PURCHASED.csv
+└── tenant_company_c/
+    ├── nodes_Person.csv
+    └── edges_KNOWS.csv
+```
+
+#### Multi-graph behavior
+
+- Each `tenant_*` subdirectory is loaded into a separate graph
+- Graph names are constructed as `{base_graph_name}_{tenant_name}`
+  - Example: `my_graph_company_a`, `my_graph_company_b`, `my_graph_company_c`
+- Each tenant is processed independently with full schema setup (indexes, constraints)
+- Progress is reported for each tenant separately
+- If no `tenant_*` subdirectories are found, the loader automatically falls back to single-graph mode
+
+#### Example output
+
+```
+🗂️  Found 3 tenant directories
+   Each will be loaded into a separate graph
+
+================================================================================
+📊 Processing tenant: company_a
+   Target graph: my_graph_company_a
+   Source directory: "./tenants/tenant_company_a"
+================================================================================
+...
+✅ Completed loading tenant 'company_a' in 12.5s
+
+================================================================================
+📊 Processing tenant: company_b
+   Target graph: my_graph_company_b
+   Source directory: "./tenants/tenant_company_b"
+================================================================================
+...
+✅ Multi-graph loading complete!
+   Loaded 3 tenants into separate graphs
+   Total time: 45.2s
 ```
 
 ## CSV File Format
