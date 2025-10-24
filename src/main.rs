@@ -284,6 +284,7 @@ impl FalkorDBCSVLoader {
         info!("📋 Found edge labels: {:?}", edge_labels.iter().collect::<Vec<_>>());
         
         // Create label mapping (case-insensitive matching)
+        // Note: Edge labels can be multi-label (e.g., "Network:Zone") which means the node has both labels
         let mut label_mapping = HashMap::new();
         let mut missing_labels = Vec::new();
         
@@ -302,6 +303,22 @@ impl FalkorDBCSVLoader {
                         info!("🔗 Mapped edge label '{}' -> node label '{}'", edge_label, node_label);
                         found = true;
                         break;
+                    }
+                }
+                
+                // If still not found, check if it's a multi-label (e.g., "Network:Zone")
+                if !found && edge_label.contains(':') {
+                    // Check if all parts of the multi-label exist as node labels
+                    let label_parts: Vec<&str> = edge_label.split(':').collect();
+                    let all_parts_exist = label_parts.iter().all(|part| {
+                        // Check case-insensitive match for each part
+                        node_labels.iter().any(|nl| nl.to_lowercase() == part.to_lowercase())
+                    });
+                    
+                    if all_parts_exist {
+                        // Multi-label is valid - keep it as-is (no mapping needed)
+                        info!("✓ Multi-label '{}' is valid (all parts exist as node labels)", edge_label);
+                        found = true;
                     }
                 }
             }
@@ -624,7 +641,51 @@ impl FalkorDBCSVLoader {
         format!("'{}'", value.replace("'", "\\'"))
     }
     
-    /// Load nodes from CSV file in batches
+    /// Parse value to appropriate JSON-compatible type for UNWIND parameters
+    fn parse_value_to_json(value: &str) -> serde_json::Value {
+        if value.is_empty() {
+            return serde_json::Value::Null;
+        }
+        
+        // Try to parse as number
+        if let Ok(num) = value.parse::<i64>() {
+            return serde_json::json!(num);
+        }
+        if let Ok(num) = value.parse::<f64>() {
+            return serde_json::json!(num);
+        }
+        
+        // Return as string
+        serde_json::json!(value)
+    }
+    
+    /// Convert serde_json::Value to Cypher literal syntax
+    /// Cypher uses unquoted keys in maps: {key: value} not {"key": "value"}
+    fn json_to_cypher_literal(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::Null => "null".to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::String(s) => {
+                // Escape single quotes and wrap in quotes
+                format!("'{}'", s.replace("\\", "\\\\").replace("'", "\\'"))
+            }
+            serde_json::Value::Array(arr) => {
+                let items: Vec<String> = arr.iter()
+                    .map(|v| Self::json_to_cypher_literal(v))
+                    .collect();
+                format!("[{}]", items.join(", "))
+            }
+            serde_json::Value::Object(map) => {
+                let items: Vec<String> = map.iter()
+                    .map(|(k, v)| format!("{}: {}", k, Self::json_to_cypher_literal(v)))
+                    .collect();
+                format!("{{{}}}", items.join(", "))
+            }
+        }
+    }
+    
+    /// Load nodes from CSV file in batches using UNWIND for better performance
     pub async fn load_nodes_batch<P: AsRef<Path>>(&self, file_path: P, batch_size: usize) -> Result<()> {
         let start_time = Instant::now();
         let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S");
@@ -672,91 +733,134 @@ impl FalkorDBCSVLoader {
                 }
             }
             
-            // Build batch query for all nodes in this batch
-            let mut query_parts = Vec::new();
-            
-            for (j, row) in batch.iter().enumerate() {
-                let empty_string = String::new();
-                let node_id = row.get("id").unwrap_or(&empty_string);
-                let mut properties = Vec::new();
-                
-                // Add all properties except id and labels
-                for (key, value) in row {
-                    if key != "id" && key != "labels" && !value.is_empty() {
-                        let parsed_value = Self::parse_value_for_property(value);
-                        if parsed_value != "None" {
-                            properties.push(format!("{}: {}", key, parsed_value));
-                        }
-                    }
-                }
-                
-                // Smart ID handling: quote if not a pure number
-                let id_str = Self::parse_id_value(node_id);
-                
-                // Debug: show properties for first few records
-                if batch_num == 0 && j < 3 {
-                    info!("    Record {}: properties = {:?}", j + 1, properties);
-                }
-                
-                // Build individual node statement
-                let node_statement = if self.merge_mode {
-                    if properties.is_empty() {
-                        format!("MERGE (:{} {{id: {}}})", label, id_str)
-                    } else {
-                        format!("MERGE (:{} {{id: {}, {}}})", label, id_str, properties.join(", "))
-                    }
-                } else {
-                    if properties.is_empty() {
-                        format!("CREATE (:{} {{id: {}}})", label, id_str)
-                    } else {
-                        format!("CREATE (:{} {{id: {}, {}}})", label, id_str, properties.join(", "))
-                    }
-                };
-                
-                query_parts.push(node_statement);
-                
-                // Debug: show generated statement for first few records
-                if batch_num == 0 && j < 3 {
-                    info!("    Generated statement: {}", query_parts.last().unwrap());
-                }
-            }
-            
             // Check if we should terminate before processing batch
             if self.terminate_on_error.load(Ordering::Relaxed) {
                 return Err(anyhow!("Loading terminated due to previous critical errors"));
             }
             
-            // Execute node queries individually to prevent FalkorDB crashes
-            if !query_parts.is_empty() {
-                let mut successful_nodes = 0;
+            // Build batch data for UNWIND - convert to JSON-compatible format
+            let mut batch_data = Vec::new();
+            
+            for (j, row) in batch.iter().enumerate() {
+                let empty_string = String::new();
+                let node_id = row.get("id").unwrap_or(&empty_string);
+                let mut properties = serde_json::Map::new();
                 
-                for node_query in &query_parts {
-                    match self.execute_graph_query(node_query).await {
-                        Ok(_) => {
-                            successful_nodes += 1;
-                        }
-                        Err(e) => {
-                            error!("❌ Error loading node with query: {}", node_query);
-                            error!("Node query error: {}", e);
-                            // Continue with other nodes instead of terminating completely
-                        }
+                // Add all properties except id and labels
+                for (key, value) in row {
+                    if key != "id" && key != "labels" && !value.is_empty() {
+                        properties.insert(key.clone(), Self::parse_value_to_json(value));
                     }
                 }
                 
-                total_loaded += successful_nodes;
+                // Convert id to appropriate type
+                let id_value = Self::parse_value_to_json(node_id);
                 
-                // Report progress for batch
-                if self.progress_interval > 0 {
-                    let progress = (total_loaded as f64 / total_records as f64) * 100.0;
-                    if total_loaded % self.progress_interval <= successful_nodes || 
-                       total_loaded == total_records {
-                        info!("📊 Progress: {:.1}% ({}/{}) {} nodes loaded", 
-                              progress, total_loaded, total_records, label);
-                    }
+                // Debug: show properties for first few records
+                if batch_num == 0 && j < 3 {
+                    info!("    Record {}: id = {:?}, properties = {:?}", j + 1, id_value, properties);
                 }
                 
-                if successful_nodes != query_parts.len() {
-                    warn!("⚠️ Loaded {} out of {} nodes in this batch", successful_nodes, query_parts.len());
+                let mut node_data = serde_json::Map::new();
+                node_data.insert("id".to_string(), id_value);
+                node_data.insert("props".to_string(), serde_json::Value::Object(properties));
+                
+                batch_data.push(serde_json::Value::Object(node_data));
+            }
+            
+            // Create single UNWIND query for the entire batch
+            let unwind_query = if self.merge_mode {
+                format!(
+                    "UNWIND $batch AS row MERGE (n:{} {{id: row.id}}) SET n += row.props",
+                    label
+                )
+            } else {
+                format!(
+                    "UNWIND $batch AS row CREATE (n:{}) SET n.id = row.id, n += row.props",
+                    label
+                )
+            };
+            
+            // Debug: show generated query for first batch
+            if batch_num == 0 {
+                info!("    Generated UNWIND query: {}", unwind_query);
+                info!("    Batch size: {} nodes", batch_data.len());
+            }
+            
+            // Execute UNWIND query with batch data using JSON parameters from PR #138
+            let mut graph = self.client.select_graph(&self.graph_name);
+            let batch_json_value = serde_json::Value::Array(batch_data.clone());
+            let mut params = HashMap::new();
+            params.insert("batch".to_string(), batch_json_value);
+            
+            let result = graph.query(&unwind_query)
+                .with_json_params(&params)
+                .execute()
+                .await;
+            
+            match result {
+                Ok(_) => {
+                    total_loaded += batch.len();
+                    
+                    // Report progress for batch
+                    if self.progress_interval > 0 {
+                        let progress = (total_loaded as f64 / total_records as f64) * 100.0;
+                        if total_loaded % self.progress_interval <= batch.len() || 
+                           total_loaded == total_records {
+                            info!("📊 Progress: {:.1}% ({}/{}) {} nodes loaded", 
+                                  progress, total_loaded, total_records, label);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("❌ Error loading batch with UNWIND: {}", e);
+                    error!("Falling back to individual queries for this batch...");
+                    
+                    // Fallback to individual queries if batch fails
+                    let mut successful_nodes = 0;
+                    for row in batch.iter() {
+                        let empty_string = String::new();
+                        let node_id = row.get("id").unwrap_or(&empty_string);
+                        let mut properties = Vec::new();
+                        
+                        for (key, value) in row {
+                            if key != "id" && key != "labels" && !value.is_empty() {
+                                let parsed_value = Self::parse_value_for_property(value);
+                                if parsed_value != "None" {
+                                    properties.push(format!("{}: {}", key, parsed_value));
+                                }
+                            }
+                        }
+                        
+                        let id_str = Self::parse_id_value(node_id);
+                        
+                        let node_query = if self.merge_mode {
+                            if properties.is_empty() {
+                                format!("MERGE (:{} {{id: {}}})", label, id_str)
+                            } else {
+                                format!("MERGE (:{} {{id: {}, {}}})", label, id_str, properties.join(", "))
+                            }
+                        } else {
+                            if properties.is_empty() {
+                                format!("CREATE (:{} {{id: {}}})", label, id_str)
+                            } else {
+                                format!("CREATE (:{} {{id: {}, {}}})", label, id_str, properties.join(", "))
+                            }
+                        };
+                        
+                        match self.execute_graph_query(&node_query).await {
+                            Ok(_) => successful_nodes += 1,
+                            Err(e2) => {
+                                error!("❌ Error loading node: {}", e2);
+                                error!("Query: {}", node_query);
+                            }
+                        }
+                    }
+                    
+                    total_loaded += successful_nodes;
+                    if successful_nodes != batch.len() {
+                        warn!("⚠️ Loaded {} out of {} nodes in this batch", successful_nodes, batch.len());
+                    }
                 }
             }
             
@@ -774,7 +878,7 @@ impl FalkorDBCSVLoader {
         Ok(())
     }
     
-    /// Load edges from CSV file in batches
+    /// Load edges from CSV file in batches using UNWIND for better performance
     pub async fn load_edges_batch<P: AsRef<Path>>(&self, file_path: P, batch_size: usize) -> Result<()> {
         let start_time = Instant::now();
         let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S");
@@ -815,9 +919,15 @@ impl FalkorDBCSVLoader {
                 }
             }
             
-            // Build batch query for all edges in this batch
-            let mut query_parts = Vec::new();
-            let mut valid_edges = 0;
+            // Check if we should terminate before processing batch
+            if self.terminate_on_error.load(Ordering::Relaxed) {
+                return Err(anyhow!("Loading terminated due to previous critical errors"));
+            }
+            
+            // Build batch data for UNWIND - convert to JSON-compatible format
+            let mut batch_data = Vec::new();
+            let mut first_source_label = String::new();
+            let mut first_target_label = String::new();
             
             for (j, row) in batch.iter().enumerate() {
                 let empty_string = String::new();
@@ -828,8 +938,7 @@ impl FalkorDBCSVLoader {
                     continue;
                 }
                 
-                valid_edges += 1;
-                let mut properties = Vec::new();
+                let mut properties = serde_json::Map::new();
                 
                 // Get source and target labels if available
                 let raw_source_label = row.get("source_label").unwrap_or(&empty_string).trim();
@@ -841,135 +950,199 @@ impl FalkorDBCSVLoader {
                 let target_label = self.label_mapping.get(raw_target_label)
                     .map_or(raw_target_label, |s| s.as_str());
                 
+                // Get first label for nodes (handle multiple labels)
+                let source_label_first = source_label.split(':').next().unwrap_or(source_label);
+                let target_label_first = target_label.split(':').next().unwrap_or(target_label);
+                
+                // Store first labels for query construction
+                if j == 0 {
+                    first_source_label = source_label_first.to_string();
+                    first_target_label = target_label_first.to_string();
+                }
+                
                 // Add all properties except source, target, type, source_label, target_label
                 for (key, value) in row {
                     if !["source", "target", "type", "source_label", "target_label"].contains(&key.as_str()) 
                        && !value.is_empty() {
-                        let parsed_value = Self::parse_value_for_property(value);
-                        if parsed_value != "None" {
-                            properties.push(format!("{}: {}", key, parsed_value));
-                        }
+                        // Clean up property key: remove duplicate prefixes like 'Date:Date' -> 'Date'
+                        let clean_key = if key.contains(':') {
+                            let parts: Vec<&str> = key.split(':').collect();
+                            if parts.len() == 2 && parts[0] == parts[1] {
+                                parts[0].to_string()
+                            } else {
+                                key.clone()
+                            }
+                        } else {
+                            key.clone()
+                        };
+                        
+                        properties.insert(clean_key, Self::parse_value_to_json(value));
                     }
                 }
                 
-                // Smart ID handling for both source and target
-                let source_id_str = Self::parse_id_value(source_id);
-                let target_id_str = Self::parse_id_value(target_id);
-                
-                // Build individual edge statement
-                let edge_statement = if !source_label.is_empty() && !target_label.is_empty() {
-                    // Use specific labels for more efficient matching
-                    let source_label_first = source_label.split(':').next().unwrap_or(source_label);
-                    let target_label_first = target_label.split(':').next().unwrap_or(target_label);
-                    
-                    if self.merge_mode {
-                        // Use MERGE for upsert behavior
-                        let prop_set = if properties.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" SET {}", properties.iter()
-                                    .map(|p| format!("r.{}", p))
-                                    .collect::<Vec<_>>()
-                                    .join(", "))
-                        };
-                        format!("MERGE (a:{} {{id: {}}}) MERGE (b:{} {{id: {}}}) MERGE (a)-[r:{}]->(b){}",
-                                source_label_first, source_id_str, target_label_first, target_id_str, 
-                                rel_type, prop_set)
-                    } else {
-                        // Use MATCH + CREATE for original behavior
-                        let prop_str = if properties.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" {{{}}}", properties.join(", "))
-                        };
-                        format!("MATCH (a:{} {{id: {}}}), (b:{} {{id: {}}}) CREATE (a)-[:{}{}]->(b)",
-                                source_label_first, source_id_str, target_label_first, target_id_str,
-                                rel_type, prop_str)
-                    }
-                } else {
-                    // Fallback to generic matching without labels
-                    if self.merge_mode {
-                        // Use MERGE for upsert behavior
-                        let prop_set = if properties.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" SET {}", properties.iter()
-                                    .map(|p| format!("r.{}", p))
-                                    .collect::<Vec<_>>()
-                                    .join(", "))
-                        };
-                        format!("MERGE (a {{id: {}}}) MERGE (b {{id: {}}}) MERGE (a)-[r:{}]->(b){}",
-                                source_id_str, target_id_str, rel_type, prop_set)
-                    } else {
-                        // Use MATCH + CREATE for original behavior
-                        let prop_str = if properties.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" {{{}}}", properties.join(", "))
-                        };
-                        format!("MATCH (a {{id: {}}}), (b {{id: {}}}) CREATE (a)-[:{}{}]->(b)",
-                                source_id_str, target_id_str, rel_type, prop_str)
-                    }
-                };
-                
-                query_parts.push(edge_statement);
+                // Convert IDs to appropriate type
+                let source_id_value = Self::parse_value_to_json(source_id);
+                let target_id_value = Self::parse_value_to_json(target_id);
                 
                 // Debug: show label usage for first few records
                 if batch_num == 0 && j < 3 {
                     info!("    Record {}: raw_source_label='{}' -> '{}', raw_target_label='{}' -> '{}'", 
-                          j + 1, raw_source_label, source_label, raw_target_label, target_label);
-                    if self.merge_mode {
-                        info!("    Using MERGE mode for relationships");
-                    } else {
-                        info!("    Using CREATE mode for relationships");
-                    }
-                    info!("    Generated statement: {}", query_parts.last().unwrap());
+                          j + 1, raw_source_label, source_label_first, raw_target_label, target_label_first);
+                }
+                
+                let mut edge_data = serde_json::Map::new();
+                edge_data.insert("source_id".to_string(), source_id_value);
+                edge_data.insert("target_id".to_string(), target_id_value);
+                edge_data.insert("source_label".to_string(), serde_json::json!(source_label_first));
+                edge_data.insert("target_label".to_string(), serde_json::json!(target_label_first));
+                edge_data.insert("props".to_string(), serde_json::Value::Object(properties));
+                
+                batch_data.push(serde_json::Value::Object(edge_data));
+            }
+            
+            if batch_data.is_empty() {
+                continue;
+            }
+            
+            // Create single UNWIND query for the entire batch
+            // NOTE: We match by ID only without label filtering because:
+            // 1. Nodes may have multi-labels (e.g., "OS:Process") and using only first label fails
+            // 2. ID is unique across the graph and indexed, so matching by ID is efficient
+            let unwind_query = if self.merge_mode {
+                format!(
+                    "UNWIND $batch AS row \
+                     MERGE (a {{id: row.source_id}}) \
+                     MERGE (b {{id: row.target_id}}) \
+                     MERGE (a)-[r:{}]->(b) \
+                     SET r += row.props",
+                    rel_type
+                )
+            } else {
+                format!(
+                    "UNWIND $batch AS row \
+                     MATCH (a {{id: row.source_id}}) \
+                     MATCH (b {{id: row.target_id}}) \
+                     CREATE (a)-[r:{}]->(b) \
+                     SET r += row.props",
+                    rel_type
+                )
+            };
+            
+            // Debug: show generated query for first batch
+            if batch_num == 0 {
+                info!("    Generated UNWIND query: {}", unwind_query);
+                info!("    Batch size: {} edges", batch_data.len());
+                if self.merge_mode {
+                    info!("    Using MERGE mode for relationships");
+                } else {
+                    info!("    Using CREATE mode for relationships");
                 }
             }
             
-            // Check if we should terminate before processing batch
-            if self.terminate_on_error.load(Ordering::Relaxed) {
-                return Err(anyhow!("Loading terminated due to previous critical errors"));
-            }
+            // Execute UNWIND query with batch data using JSON parameters from PR #138
+            let mut graph = self.client.select_graph(&self.graph_name);
+            let batch_json_value = serde_json::Value::Array(batch_data.clone());
+            let mut params = HashMap::new();
+            params.insert("batch".to_string(), batch_json_value);
             
-            // Execute edge queries individually to avoid Cypher syntax issues
-            if !query_parts.is_empty() {
-                let mut successful_edges = 0;
-                
-                for edge_query in &query_parts {
-                    match self.execute_graph_query(edge_query).await {
-                        Ok(_) => {
-                            successful_edges += 1;
-                        }
-                        Err(e) => {
-                            error!("❌ Error loading edge with query: {}", edge_query);
-                            error!("Edge query error: {}", e);
-                            // Continue with other edges instead of terminating completely
+            let result = graph.query(&unwind_query)
+                .with_json_params(&params)
+                .execute()
+                .await;
+            
+            match result {
+                Ok(_) => {
+                    total_loaded += batch_data.len();
+                    
+                    // Report progress for batch
+                    if self.progress_interval > 0 {
+                        let progress = (total_loaded as f64 / total_records as f64) * 100.0;
+                        if total_loaded % self.progress_interval <= batch_data.len() || 
+                           total_loaded == total_records {
+                            info!("📊 Progress: {:.1}% ({}/{}) {} edges loaded", 
+                                  progress, total_loaded, total_records, rel_type);
                         }
                     }
                 }
-                
-                total_loaded += successful_edges;
-                
-                // Report progress for batch
-                if self.progress_interval > 0 {
-                    let progress = (total_loaded as f64 / total_records as f64) * 100.0;
-                    if total_loaded % self.progress_interval <= successful_edges || 
-                       total_loaded == total_records {
-                        info!("📊 Progress: {:.1}% ({}/{}) {} edges loaded", 
-                              progress, total_loaded, total_records, rel_type);
+                Err(e) => {
+                    error!("❌ Error loading batch with UNWIND: {}", e);
+                    error!("Falling back to individual queries for this batch...");
+                    
+                    // Fallback to individual queries if batch fails
+                    let mut successful_edges = 0;
+                    for row in batch.iter() {
+                        let empty_string = String::new();
+                        let source_id = row.get("source").unwrap_or(&empty_string);
+                        let target_id = row.get("target").unwrap_or(&empty_string);
+                        
+                        if source_id.is_empty() || target_id.is_empty() {
+                            continue;
+                        }
+                        
+                        let mut properties = Vec::new();
+                        let raw_source_label = row.get("source_label").unwrap_or(&empty_string).trim();
+                        let raw_target_label = row.get("target_label").unwrap_or(&empty_string).trim();
+                        
+                        let source_label = self.label_mapping.get(raw_source_label)
+                            .map_or(raw_source_label, |s| s.as_str());
+                        let target_label = self.label_mapping.get(raw_target_label)
+                            .map_or(raw_target_label, |s| s.as_str());
+                        
+                        for (key, value) in row {
+                            if !["source", "target", "type", "source_label", "target_label"].contains(&key.as_str()) 
+                               && !value.is_empty() {
+                                let parsed_value = Self::parse_value_for_property(value);
+                                if parsed_value != "None" {
+                                    properties.push(format!("{}: {}", key, parsed_value));
+                                }
+                            }
+                        }
+                        
+                        let source_id_str = Self::parse_id_value(source_id);
+                        let target_id_str = Self::parse_id_value(target_id);
+                        
+                        // Match by ID only (without labels) to handle multi-label nodes correctly
+                        let edge_query = if self.merge_mode {
+                            let prop_set = if properties.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" SET {}", properties.iter()
+                                        .map(|p| format!("r.{}", p))
+                                        .collect::<Vec<_>>()
+                                        .join(", "))
+                            };
+                            format!("MERGE (a {{id: {}}}) MERGE (b {{id: {}}}) MERGE (a)-[r:{}]->(b){}",
+                                    source_id_str, target_id_str, rel_type, prop_set)
+                        } else {
+                            let prop_str = if properties.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" {{{}}}", properties.join(", "))
+                            };
+                            format!("MATCH (a {{id: {}}}), (b {{id: {}}}) CREATE (a)-[:{}{}]->(b)",
+                                    source_id_str, target_id_str, rel_type, prop_str)
+                        };
+                        
+                        match self.execute_graph_query(&edge_query).await {
+                            Ok(_) => successful_edges += 1,
+                            Err(e2) => {
+                                error!("❌ Error loading edge: {}", e2);
+                                error!("Query: {}", edge_query);
+                            }
+                        }
                     }
-                }
-                
-                if successful_edges != query_parts.len() {
-                    warn!("⚠️ Loaded {} out of {} edges in this batch", successful_edges, query_parts.len());
+                    
+                    total_loaded += successful_edges;
+                    if successful_edges != batch.len() {
+                        warn!("⚠️ Loaded {} out of {} edges in this batch", successful_edges, batch.len());
+                    }
                 }
             }
             
             let batch_duration = batch_start_time.elapsed();
             let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S");
             info!("[{}] Batch complete: Loaded {} edges (Duration: {:?})", 
-                  timestamp, batch.len(), batch_duration);
+                  timestamp, batch_data.len(), batch_duration);
         }
         
         let duration = start_time.elapsed();
