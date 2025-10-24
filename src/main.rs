@@ -62,6 +62,10 @@ struct Args {
     /// Enable fail-fast mode (terminate on first critical error)
     #[arg(long)]
     fail_fast: bool,
+    
+    /// Enable multi-graph mode: load each tenant_* subfolder into a separate graph
+    #[arg(long)]
+    multi_graph: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,8 +96,10 @@ struct ConstraintRecord {
 pub struct FalkorDBCSVLoader {
     client: FalkorAsyncClient,
     graph_name: String,
+    base_graph_name: String,  // Original graph name used as prefix in multi-graph mode
     csv_dir: PathBuf,
     merge_mode: bool,
+    multi_graph_mode: bool,
     progress_interval: usize,
     /// Flag to indicate if loading should terminate on errors
     terminate_on_error: Arc<AtomicBool>,
@@ -113,6 +119,7 @@ impl FalkorDBCSVLoader {
         username: Option<String>,
         password: Option<String>,
         merge_mode: bool,
+        multi_graph_mode: bool,
         progress_interval: usize,
     ) -> Result<Self> {
         info!("Connecting to FalkorDB at {}:{}...", host, port);
@@ -136,9 +143,11 @@ impl FalkorDBCSVLoader {
         
         let loader = Self {
             client,
-            graph_name,
+            graph_name: graph_name.clone(),
+            base_graph_name: graph_name,
             csv_dir: PathBuf::from(csv_dir),
             merge_mode,
+            multi_graph_mode,
             progress_interval,
             terminate_on_error: Arc::new(AtomicBool::new(false)),
             max_consecutive_failures: 3,
@@ -1206,6 +1215,16 @@ impl FalkorDBCSVLoader {
             return Err(anyhow!("Directory {:?} does not exist", self.csv_dir));
         }
         
+        // Check for multi-graph mode
+        if self.multi_graph_mode {
+            self.load_multi_graph_csvs(batch_size).await
+        } else {
+            self.load_single_graph_csvs(batch_size).await
+        }
+    }
+    
+    /// Load CSV files into a single graph
+    async fn load_single_graph_csvs(&mut self, batch_size: usize) -> Result<()> {
         // Validate label consistency first
         let label_mapping = self.validate_label_consistency()?;
         self.label_mapping = label_mapping;
@@ -1353,6 +1372,86 @@ impl FalkorDBCSVLoader {
         Ok(())
     }
     
+    /// Load CSV files from tenant subdirectories into separate graphs
+    async fn load_multi_graph_csvs(&mut self, batch_size: usize) -> Result<()> {
+        // Find all tenant subdirectories
+        let mut tenant_dirs = Vec::new();
+        
+        for entry in std::fs::read_dir(&self.csv_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(dir_name) = path.file_name() {
+                    let dir_name_str = dir_name.to_string_lossy();
+                    if dir_name_str.starts_with("tenant_") {
+                        tenant_dirs.push(path);
+                    }
+                }
+            }
+        }
+        
+        if tenant_dirs.is_empty() {
+            warn!("⚠️  No tenant subdirectories found in {:?}", self.csv_dir);
+            warn!("   Falling back to single-graph mode...");
+            return self.load_single_graph_csvs(batch_size).await;
+        }
+        
+        tenant_dirs.sort();
+        let tenant_count = tenant_dirs.len();
+        info!("\n🗂️  Found {} tenant directories", tenant_count);
+        info!("   Each will be loaded into a separate graph\n");
+        
+        let overall_start_time = Instant::now();
+        
+        for tenant_path in &tenant_dirs {
+            let tenant_name = tenant_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .replace("tenant_", "");
+            
+            let graph_name = format!("{}_{}", self.base_graph_name, tenant_name);
+            
+            info!("\n{}", "=".repeat(80));
+            info!("📊 Processing tenant: {}", tenant_name);
+            info!("   Target graph: {}", graph_name);
+            info!("   Source directory: {:?}", tenant_path);
+            info!("{}
+", "=".repeat(80));
+            
+            // Switch to this tenant's graph
+            self.graph_name = graph_name.clone();
+            
+            // Temporarily update csv_dir to point to tenant directory
+            let original_csv_dir = self.csv_dir.clone();
+            self.csv_dir = tenant_path.clone();
+            
+            // Load this tenant's data
+            let tenant_start_time = Instant::now();
+            match self.load_single_graph_csvs(batch_size).await {
+                Ok(_) => {
+                    let tenant_duration = tenant_start_time.elapsed();
+                    info!("\n✅ Completed loading tenant '{}' in {:?}", tenant_name, tenant_duration);
+                }
+                Err(e) => {
+                    error!("\n❌ Error loading tenant '{}': {}", tenant_name, e);
+                }
+            }
+            
+            // Restore original csv_dir
+            self.csv_dir = original_csv_dir;
+        }
+        
+        let overall_duration = overall_start_time.elapsed();
+        info!("\n{}", "=".repeat(80));
+        info!("✅ Multi-graph loading complete!");
+        info!("   Loaded {} tenants into separate graphs", tenant_count);
+        info!("   Total time: {:?}", overall_duration);
+        info!("{}", "=".repeat(80));
+        
+        Ok(())
+    }
+    
     /// Verify node attributes for a specific node type
     pub async fn verify_node_attributes(&self, label: &str, limit: usize) -> Result<()> {
         let query = format!("MATCH (n:{}) RETURN n LIMIT {}", label, limit);
@@ -1414,6 +1513,7 @@ async fn main() -> Result<()> {
         args.username,
         args.password,
         args.merge_mode,
+        args.multi_graph,
         args.progress_interval,
     ).await?;
     
