@@ -132,9 +132,9 @@ checksum = "d71b6127be86fdcfddb610f7182ac57211d4b18a3e9c82eb2d17662f2227ad6a"
 
 [[package]]
 name = "cc"
-version = "1.2.41"
+version = "1.2.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac9fe6cdbb24b6ade63616c0a0688e45bb56732262c158df3c0c4bea4ca47cb7"
+checksum = "739eb0f94557554b3ca9a86d2d37bebd49c5e6d0c1d2bda35ba5bdac830befc2"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -280,7 +280,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "falkordb"
 version = "0.1.11"
-source = "git+https://github.com/FalkorDB/falkordb-rs?branch=feature%2Fjson-params-support#902b87a3309a36e8635073d0b8c8d81810f45aea"
+source = "git+https://github.com/FalkorDB/falkordb-rs?branch=feature%2Fjson-params-support#554afdb0f26930a228e0b0a320140bcb3d27a709"
 dependencies = [
  "parking_lot",
  "redis",

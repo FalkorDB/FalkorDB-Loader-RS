@@ -1014,27 +1014,56 @@ impl FalkorDBCSVLoader {
             }
             
             // Create single UNWIND query for the entire batch
-            // NOTE: We match by ID only without label filtering because:
-            // 1. Nodes may have multi-labels (e.g., "OS:Process") and using only first label fails
-            // 2. ID is unique across the graph and indexed, so matching by ID is efficient
-            let unwind_query = if self.merge_mode {
-                format!(
-                    "UNWIND $batch AS row \
-                     MERGE (a {{id: row.source_id}}) \
-                     MERGE (b {{id: row.target_id}}) \
-                     MERGE (a)-[r:{}]->(b) \
-                     SET r += row.props",
-                    rel_type
-                )
+            // Use the first label from multi-labels for efficient index usage
+            // For multi-labels like "OS:Process", we use "OS" to leverage the index on OS.id
+            let unwind_query = if !batch_data.is_empty() {
+                let first_edge = batch_data[0].as_object().unwrap();
+                let source_label = first_edge["source_label"].as_str().unwrap_or("");
+                let target_label = first_edge["target_label"].as_str().unwrap_or("");
+                
+                if self.merge_mode {
+                    if !source_label.is_empty() && !target_label.is_empty() {
+                        format!(
+                            "UNWIND $batch AS row \
+                             MERGE (a:{} {{id: row.source_id}}) \
+                             MERGE (b:{} {{id: row.target_id}}) \
+                             MERGE (a)-[r:{}]->(b) \
+                             SET r += row.props",
+                            source_label, target_label, rel_type
+                        )
+                    } else {
+                        format!(
+                            "UNWIND $batch AS row \
+                             MERGE (a {{id: row.source_id}}) \
+                             MERGE (b {{id: row.target_id}}) \
+                             MERGE (a)-[r:{}]->(b) \
+                             SET r += row.props",
+                            rel_type
+                        )
+                    }
+                } else {
+                    if !source_label.is_empty() && !target_label.is_empty() {
+                        format!(
+                            "UNWIND $batch AS row \
+                             MATCH (a:{} {{id: row.source_id}}) \
+                             MATCH (b:{} {{id: row.target_id}}) \
+                             CREATE (a)-[r:{}]->(b) \
+                             SET r += row.props",
+                            source_label, target_label, rel_type
+                        )
+                    } else {
+                        format!(
+                            "UNWIND $batch AS row \
+                             MATCH (a {{id: row.source_id}}) \
+                             MATCH (b {{id: row.target_id}}) \
+                             CREATE (a)-[r:{}]->(b) \
+                             SET r += row.props",
+                            rel_type
+                        )
+                    }
+                }
             } else {
-                format!(
-                    "UNWIND $batch AS row \
-                     MATCH (a {{id: row.source_id}}) \
-                     MATCH (b {{id: row.target_id}}) \
-                     CREATE (a)-[r:{}]->(b) \
-                     SET r += row.props",
-                    rel_type
-                )
+                continue; // Skip empty batches
             };
             
             // Debug: show generated query for first batch
@@ -1110,7 +1139,11 @@ impl FalkorDBCSVLoader {
                         let source_id_str = Self::parse_id_value(source_id);
                         let target_id_str = Self::parse_id_value(target_id);
                         
-                        // Match by ID only (without labels) to handle multi-label nodes correctly
+                        // Get first label from multi-labels for efficient matching
+                        let source_label_first = source_label.split(':').next().unwrap_or(source_label);
+                        let target_label_first = target_label.split(':').next().unwrap_or(target_label);
+                        
+                        // Use labels if available for efficient index usage
                         let edge_query = if self.merge_mode {
                             let prop_set = if properties.is_empty() {
                                 String::new()
@@ -1120,16 +1153,26 @@ impl FalkorDBCSVLoader {
                                         .collect::<Vec<_>>()
                                         .join(", "))
                             };
-                            format!("MERGE (a {{id: {}}}) MERGE (b {{id: {}}}) MERGE (a)-[r:{}]->(b){}",
-                                    source_id_str, target_id_str, rel_type, prop_set)
+                            if !source_label_first.is_empty() && !target_label_first.is_empty() {
+                                format!("MERGE (a:{} {{id: {}}}) MERGE (b:{} {{id: {}}}) MERGE (a)-[r:{}]->(b){}",
+                                        source_label_first, source_id_str, target_label_first, target_id_str, rel_type, prop_set)
+                            } else {
+                                format!("MERGE (a {{id: {}}}) MERGE (b {{id: {}}}) MERGE (a)-[r:{}]->(b){}",
+                                        source_id_str, target_id_str, rel_type, prop_set)
+                            }
                         } else {
                             let prop_str = if properties.is_empty() {
                                 String::new()
                             } else {
                                 format!(" {{{}}}", properties.join(", "))
                             };
-                            format!("MATCH (a {{id: {}}}), (b {{id: {}}}) CREATE (a)-[:{}{}]->(b)",
-                                    source_id_str, target_id_str, rel_type, prop_str)
+                            if !source_label_first.is_empty() && !target_label_first.is_empty() {
+                                format!("MATCH (a:{} {{id: {}}}), (b:{} {{id: {}}}) CREATE (a)-[:{}{}]->(b)",
+                                        source_label_first, source_id_str, target_label_first, target_id_str, rel_type, prop_str)
+                            } else {
+                                format!("MATCH (a {{id: {}}}), (b {{id: {}}}) CREATE (a)-[:{}{}]->(b)",
+                                        source_id_str, target_id_str, rel_type, prop_str)
+                            }
                         };
                         
                         match self.execute_graph_query(&edge_query).await {
