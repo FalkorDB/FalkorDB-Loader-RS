@@ -280,12 +280,11 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "falkordb"
 version = "0.1.11"
-source = "git+https://github.com/FalkorDB/falkordb-rs?branch=feature%2Fjson-params-support#554afdb0f26930a228e0b0a320140bcb3d27a709"
+source = "git+https://github.com/FalkorDB/falkordb-rs?branch=main#312d9c4fb6059d9da5ce7275eab779a4483d71c6"
 dependencies = [
  "parking_lot",
  "redis",
  "regex",
- "serde_json",
  "strum",
  "thiserror",
  "tokio",

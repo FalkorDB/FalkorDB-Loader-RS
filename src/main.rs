@@ -650,49 +650,40 @@ impl FalkorDBCSVLoader {
         format!("'{}'", value.replace("'", "\\'"))
     }
     
-    /// Parse value to appropriate JSON-compatible type for UNWIND parameters
-    fn parse_value_to_json(value: &str) -> serde_json::Value {
+    /// Convert a value to Cypher literal syntax
+    fn value_to_cypher_literal(value: &str) -> String {
         if value.is_empty() {
-            return serde_json::Value::Null;
+            return "null".to_string();
         }
         
-        // Try to parse as number
+        // Try to parse as integer
         if let Ok(num) = value.parse::<i64>() {
-            return serde_json::json!(num);
-        }
-        if let Ok(num) = value.parse::<f64>() {
-            return serde_json::json!(num);
+            return num.to_string();
         }
         
-        // Return as string
-        serde_json::json!(value)
+        // Try to parse as float
+        if let Ok(num) = value.parse::<f64>() {
+            return num.to_string();
+        }
+        
+        // Escape and quote as string
+        format!("'{}'", value.replace("\\", "\\\\").replace("'", "\\'"))
     }
     
-    /// Convert serde_json::Value to Cypher literal syntax
-    /// Cypher uses unquoted keys in maps: {key: value} not {"key": "value"}
-    fn json_to_cypher_literal(value: &serde_json::Value) -> String {
-        match value {
-            serde_json::Value::Null => "null".to_string(),
-            serde_json::Value::Bool(b) => b.to_string(),
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::String(s) => {
-                // Escape single quotes and wrap in quotes
-                format!("'{}'", s.replace("\\", "\\\\").replace("'", "\\'"))
-            }
-            serde_json::Value::Array(arr) => {
-                let items: Vec<String> = arr.iter()
-                    .map(|v| Self::json_to_cypher_literal(v))
-                    .collect();
-                format!("[{}]", items.join(", "))
-            }
-            serde_json::Value::Object(map) => {
-                let items: Vec<String> = map.iter()
-                    .map(|(k, v)| format!("{}: {}", k, Self::json_to_cypher_literal(v)))
-                    .collect();
-                format!("{{{}}}", items.join(", "))
-            }
+    /// Build Cypher map literal from properties HashMap
+    fn build_cypher_map(properties: &HashMap<String, String>) -> String {
+        if properties.is_empty() {
+            return "{}".to_string();
         }
+        
+        let props: Vec<String> = properties
+            .iter()
+            .map(|(k, v)| format!("{}: {}", k, Self::value_to_cypher_literal(v)))
+            .collect();
+        
+        format!("{{{}}}", props.join(", "))
     }
+    
     
     /// Load nodes from CSV file in batches using UNWIND for better performance
     pub async fn load_nodes_batch<P: AsRef<Path>>(&self, file_path: P, batch_size: usize) -> Result<()> {
@@ -747,63 +738,62 @@ impl FalkorDBCSVLoader {
                 return Err(anyhow!("Loading terminated due to previous critical errors"));
             }
             
-            // Build batch data for UNWIND - convert to JSON-compatible format
-            let mut batch_data = Vec::new();
+            // Build batch data as Cypher list literals
+            let mut batch_items = Vec::new();
             
             for (j, row) in batch.iter().enumerate() {
                 let empty_string = String::new();
                 let node_id = row.get("id").unwrap_or(&empty_string);
-                let mut properties = serde_json::Map::new();
+                let mut properties = HashMap::new();
                 
                 // Add all properties except id and labels
                 for (key, value) in row {
                     if key != "id" && key != "labels" && !value.is_empty() {
-                        properties.insert(key.clone(), Self::parse_value_to_json(value));
+                        properties.insert(key.clone(), value.clone());
                     }
                 }
                 
-                // Convert id to appropriate type
-                let id_value = Self::parse_value_to_json(node_id);
-                
                 // Debug: show properties for first few records
                 if batch_num == 0 && j < 3 {
-                    info!("    Record {}: id = {:?}, properties = {:?}", j + 1, id_value, properties);
+                    info!("    Record {}: id = {:?}, properties = {:?}", j + 1, node_id, properties);
                 }
                 
-                let mut node_data = serde_json::Map::new();
-                node_data.insert("id".to_string(), id_value);
-                node_data.insert("props".to_string(), serde_json::Value::Object(properties));
+                // Build Cypher map: {id: value, props: {key: val, ...}}
+                let id_literal = Self::value_to_cypher_literal(node_id);
+                let props_map = Self::build_cypher_map(&properties);
+                let item = format!("{{id: {}, props: {}}}", id_literal, props_map);
                 
-                batch_data.push(serde_json::Value::Object(node_data));
+                batch_items.push(item);
             }
             
-            // Create single UNWIND query for the entire batch
+            // Build complete UNWIND query with inline batch data
+            let batch_literal = format!("[{}]", batch_items.join(", "));
+            
             let unwind_query = if self.merge_mode {
                 format!(
-                    "UNWIND $batch AS row MERGE (n:{} {{id: row.id}}) SET n += row.props",
-                    label
+                    "UNWIND {} AS row MERGE (n:{} {{id: row.id}}) SET n += row.props",
+                    batch_literal, label
                 )
             } else {
                 format!(
-                    "UNWIND $batch AS row CREATE (n:{}) SET n.id = row.id, n += row.props",
-                    label
+                    "UNWIND {} AS row CREATE (n:{}) SET n.id = row.id, n += row.props",
+                    batch_literal, label
                 )
             };
             
             // Debug: show generated query for first batch
             if batch_num == 0 {
-                info!("    Generated UNWIND query: {}", unwind_query);
-                info!("    Batch size: {} nodes", batch_data.len());
+                info!("    Generated UNWIND query template");
+                info!("    Batch size: {} nodes", batch_items.len());
+                if batch_items.len() > 0 {
+                    info!("    First item example: {}", batch_items[0]);
+                }
             }
             
-            // Execute UNWIND query with batch data using JSON parameters from PR #138
+            // Execute UNWIND query with inline batch data
             let mut graph = self.client.select_graph(&self.graph_name);
-            let batch_json_value = serde_json::Value::Array(batch_data.clone());
-            let mut params = HashMap::new();
-            params.insert("batch".to_string(), batch_json_value);
             
             let result = graph.query(&unwind_query)
-                .with_json_params(&params)
                 .execute()
                 .await;
             
@@ -933,8 +923,8 @@ impl FalkorDBCSVLoader {
                 return Err(anyhow!("Loading terminated due to previous critical errors"));
             }
             
-            // Build batch data for UNWIND - convert to JSON-compatible format
-            let mut batch_data = Vec::new();
+            // Build batch data as Cypher list literals
+            let mut batch_items = Vec::new();
             let mut first_source_label = String::new();
             let mut first_target_label = String::new();
             
@@ -947,7 +937,7 @@ impl FalkorDBCSVLoader {
                     continue;
                 }
                 
-                let mut properties = serde_json::Map::new();
+                let mut properties = HashMap::new();
                 
                 // Get source and target labels if available
                 let raw_source_label = row.get("source_label").unwrap_or(&empty_string).trim();
@@ -985,13 +975,9 @@ impl FalkorDBCSVLoader {
                             key.clone()
                         };
                         
-                        properties.insert(clean_key, Self::parse_value_to_json(value));
+                        properties.insert(clean_key, value.clone());
                     }
                 }
-                
-                // Convert IDs to appropriate type
-                let source_id_value = Self::parse_value_to_json(source_id);
-                let target_id_value = Self::parse_value_to_json(target_id);
                 
                 // Debug: show label usage for first few records
                 if batch_num == 0 && j < 3 {
@@ -999,77 +985,76 @@ impl FalkorDBCSVLoader {
                           j + 1, raw_source_label, source_label_first, raw_target_label, target_label_first);
                 }
                 
-                let mut edge_data = serde_json::Map::new();
-                edge_data.insert("source_id".to_string(), source_id_value);
-                edge_data.insert("target_id".to_string(), target_id_value);
-                edge_data.insert("source_label".to_string(), serde_json::json!(source_label_first));
-                edge_data.insert("target_label".to_string(), serde_json::json!(target_label_first));
-                edge_data.insert("props".to_string(), serde_json::Value::Object(properties));
+                // Build Cypher map: {source_id: val, target_id: val, props: {...}}
+                let source_id_literal = Self::value_to_cypher_literal(source_id);
+                let target_id_literal = Self::value_to_cypher_literal(target_id);
+                let props_map = Self::build_cypher_map(&properties);
+                let item = format!(
+                    "{{source_id: {}, target_id: {}, props: {}}}",
+                    source_id_literal, target_id_literal, props_map
+                );
                 
-                batch_data.push(serde_json::Value::Object(edge_data));
+                batch_items.push(item);
             }
             
-            if batch_data.is_empty() {
+            if batch_items.is_empty() {
                 continue;
             }
             
+            // Build complete UNWIND query with inline batch data
+            let batch_literal = format!("[{}]", batch_items.join(", "));
+            
             // Create single UNWIND query for the entire batch
             // Use the first label from multi-labels for efficient index usage
-            // For multi-labels like "OS:Process", we use "OS" to leverage the index on OS.id
-            let unwind_query = if !batch_data.is_empty() {
-                let first_edge = batch_data[0].as_object().unwrap();
-                let source_label = first_edge["source_label"].as_str().unwrap_or("");
-                let target_label = first_edge["target_label"].as_str().unwrap_or("");
-                
-                if self.merge_mode {
-                    if !source_label.is_empty() && !target_label.is_empty() {
-                        format!(
-                            "UNWIND $batch AS row \
-                             MERGE (a:{} {{id: row.source_id}}) \
-                             MERGE (b:{} {{id: row.target_id}}) \
-                             MERGE (a)-[r:{}]->(b) \
-                             SET r += row.props",
-                            source_label, target_label, rel_type
-                        )
-                    } else {
-                        format!(
-                            "UNWIND $batch AS row \
-                             MERGE (a {{id: row.source_id}}) \
-                             MERGE (b {{id: row.target_id}}) \
-                             MERGE (a)-[r:{}]->(b) \
-                             SET r += row.props",
-                            rel_type
-                        )
-                    }
+            let unwind_query = if self.merge_mode {
+                if !first_source_label.is_empty() && !first_target_label.is_empty() {
+                    format!(
+                        "UNWIND {} AS row \
+                         MERGE (a:{} {{id: row.source_id}}) \
+                         MERGE (b:{} {{id: row.target_id}}) \
+                         MERGE (a)-[r:{}]->(b) \
+                         SET r += row.props",
+                        batch_literal, first_source_label, first_target_label, rel_type
+                    )
                 } else {
-                    if !source_label.is_empty() && !target_label.is_empty() {
-                        format!(
-                            "UNWIND $batch AS row \
-                             MATCH (a:{} {{id: row.source_id}}) \
-                             MATCH (b:{} {{id: row.target_id}}) \
-                             CREATE (a)-[r:{}]->(b) \
-                             SET r += row.props",
-                            source_label, target_label, rel_type
-                        )
-                    } else {
-                        format!(
-                            "UNWIND $batch AS row \
-                             MATCH (a {{id: row.source_id}}) \
-                             MATCH (b {{id: row.target_id}}) \
-                             CREATE (a)-[r:{}]->(b) \
-                             SET r += row.props",
-                            rel_type
-                        )
-                    }
+                    format!(
+                        "UNWIND {} AS row \
+                         MERGE (a {{id: row.source_id}}) \
+                         MERGE (b {{id: row.target_id}}) \
+                         MERGE (a)-[r:{}]->(b) \
+                         SET r += row.props",
+                        batch_literal, rel_type
+                    )
                 }
             } else {
-                continue; // Skip empty batches
+                if !first_source_label.is_empty() && !first_target_label.is_empty() {
+                    format!(
+                        "UNWIND {} AS row \
+                         MATCH (a:{} {{id: row.source_id}}) \
+                         MATCH (b:{} {{id: row.target_id}}) \
+                         CREATE (a)-[r:{}]->(b) \
+                         SET r += row.props",
+                        batch_literal, first_source_label, first_target_label, rel_type
+                    )
+                } else {
+                    format!(
+                        "UNWIND {} AS row \
+                         MATCH (a {{id: row.source_id}}) \
+                         MATCH (b {{id: row.target_id}}) \
+                         CREATE (a)-[r:{}]->(b) \
+                         SET r += row.props",
+                        batch_literal, rel_type
+                    )
+                }
             };
             
             // Debug: show generated query for first batch
             if batch_num == 0 {
-                info!("    Generated UNWIND query: {}", unwind_query);
-                info!("    Batch size: {} edges", batch_data.len());
+                info!("    Generated UNWIND query template");
+                info!("    Batch size: {} edges", batch_items.len());
+                if batch_items.len() > 0 {
+                    info!("    First item example: {}", batch_items[0]);
+                }
                 if self.merge_mode {
                     info!("    Using MERGE mode for relationships");
                 } else {
@@ -1077,25 +1062,21 @@ impl FalkorDBCSVLoader {
                 }
             }
             
-            // Execute UNWIND query with batch data using JSON parameters from PR #138
+            // Execute UNWIND query with inline batch data
             let mut graph = self.client.select_graph(&self.graph_name);
-            let batch_json_value = serde_json::Value::Array(batch_data.clone());
-            let mut params = HashMap::new();
-            params.insert("batch".to_string(), batch_json_value);
             
             let result = graph.query(&unwind_query)
-                .with_json_params(&params)
                 .execute()
                 .await;
             
             match result {
                 Ok(_) => {
-                    total_loaded += batch_data.len();
+                    total_loaded += batch_items.len();
                     
                     // Report progress for batch
                     if self.progress_interval > 0 {
                         let progress = (total_loaded as f64 / total_records as f64) * 100.0;
-                        if total_loaded % self.progress_interval <= batch_data.len() || 
+                        if total_loaded % self.progress_interval <= batch_items.len() || 
                            total_loaded == total_records {
                             info!("📊 Progress: {:.1}% ({}/{}) {} edges loaded", 
                                   progress, total_loaded, total_records, rel_type);
@@ -1194,7 +1175,7 @@ impl FalkorDBCSVLoader {
             let batch_duration = batch_start_time.elapsed();
             let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S");
             info!("[{}] Batch complete: Loaded {} edges (Duration: {:?})", 
-                  timestamp, batch_data.len(), batch_duration);
+                  timestamp, batch_items.len(), batch_duration);
         }
         
         let duration = start_time.elapsed();
