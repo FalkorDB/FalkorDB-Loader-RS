@@ -260,7 +260,7 @@ The application is structured as follows:
 
 ## License
 
-[Add your license information here]
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
 ## Support
 
